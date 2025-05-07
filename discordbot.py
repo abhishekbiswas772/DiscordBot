@@ -3,6 +3,10 @@ import json
 import random
 import asyncio
 import discord
+import requests
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 import google.generativeai as genai
@@ -19,6 +23,12 @@ CONFIG = {
     "JOB_CHANNEL_ID": int(os.getenv("JOB_CHANNEL_ID", 0)),            # Cast to int
     "DATA_DIR": "./data",
     "REMINDER_INTERVAL_HOURS": 3,
+    # The PORT environment variable will be provided by Render
+    "PORT": int(os.getenv("PORT", 10000)),
+    # Render URL (update this with your actual app name when deployed)
+    "RENDER_URL": os.getenv("RENDER_URL", "https://productivitypal.onrender.com"),
+    # Render spins down after 15 minutes of inactivity
+    "PING_INTERVAL_MINUTES": 14  # Ping every 14 minutes to stay active
 }
 
 # Create data directory if it doesn't exist
@@ -31,6 +41,37 @@ genai.configure(api_key=CONFIG["GEMINI_API_KEY"])
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 bot.remove_command('help')  # Remove default help command to create custom one
+
+# HTTP Server for health checks
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'ProductivityPal Discord Bot is running!')
+        
+    def log_message(self, format, *args):
+        # Suppress log messages to avoid cluttering the console
+        return
+
+# Function to run HTTP server
+def run_http_server():
+    server = HTTPServer(('0.0.0.0', CONFIG["PORT"]), SimpleHTTPRequestHandler)
+    print(f"Starting HTTP server on port {CONFIG['PORT']}")
+    server.serve_forever()
+
+# Function to keep the service alive (prevent Render from spinning down)
+def keep_alive():
+    """Pings the bot's HTTP server to prevent Render from spinning down after 15 minutes of inactivity."""
+    url = CONFIG["RENDER_URL"]
+    while True:
+        try:
+            response = requests.get(url)
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{current_time}] Keep-alive ping sent. Status code: {response.status_code}")
+        except Exception as e:
+            print(f"Keep-alive error: {e}")
+        # Sleep for 14 minutes (Render free tier timeout is 15 min)
+        time.sleep(CONFIG["PING_INTERVAL_MINUTES"] * 60)
 
 # Function to check channel access
 async def check_channels():
@@ -532,7 +573,7 @@ async def jobs_command(ctx):
 @bot.command(name='help')
 async def help_command(ctx):
     embed = discord.Embed(
-        title="Productivity Bot Help",
+        title="ProductivityPal Help",
         description="Here are the available commands:",
         color=0x3498db
     )
@@ -585,6 +626,22 @@ async def diagnose_command(ctx):
         value=f"Found {len(data_files)} data files in {CONFIG['DATA_DIR']}" if data_dir.exists() else "❌ Data directory not found", 
         inline=False
     )
+
+    # Check if HTTP server is running
+    try:
+        response = requests.get(f"http://localhost:{CONFIG['PORT']}")
+        http_status = f"✅ HTTP server running (Status: {response.status_code})"
+    except:
+        http_status = "❌ HTTP server not responding"
+        
+    embed.add_field(name="HTTP Health Check", value=http_status, inline=False)
+    
+    # Check keep-alive mechanism
+    embed.add_field(
+        name="Keep-Alive Service", 
+        value=f"✅ Running (pinging every {CONFIG['PING_INTERVAL_MINUTES']} minutes)", 
+        inline=False
+    )
     
     embed.set_footer(text="Run !help for available commands")
     
@@ -599,8 +656,20 @@ async def welcome_command(ctx):
 
 if __name__ == "__main__":
     try:
-        print("Starting Discord Productivity Bot...")
+        print("Starting ProductivityPal Discord Bot...")
         print(f"Data directory: {CONFIG['DATA_DIR']}")
+        
+        # Start HTTP server in a separate thread
+        http_thread = threading.Thread(target=run_http_server, daemon=True)
+        http_thread.start()
+        print(f"HTTP server started on port {CONFIG['PORT']}")
+        
+        # Start keep-alive mechanism in a separate thread
+        keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+        keep_alive_thread.start()
+        print(f"Keep-alive service started (interval: {CONFIG['PING_INTERVAL_MINUTES']} minutes)")
+        
+        # Run the bot
         bot.run(CONFIG["DISCORD_TOKEN"])
     except discord.errors.LoginFailure:
         print("⚠️ ERROR: Invalid Discord token. Please check your .env file.")
